@@ -1,0 +1,964 @@
+---
+title: "spital"
+author: "Lambridge"
+date: "2021/12/13"
+output: html_document
+---
+解释假设检验
+在 R 中执行回归
+描述与回归模型关联的假设
+解释处理空间自相关（附近观测值的空间相似性）残差的步骤。
+
+7.4.1 Setting up your Data
+
+First, let’s set up R and read in some data to enable us to carry out our analysis.
+```{r}
+library(tidyverse)
+library(tmap)
+library(geojsonio)
+library(plotly)
+library(rgdal)
+library(broom)
+library(mapview)
+library(crosstalk)
+library(sf)
+library(sp)
+library(spdep)
+library(car)
+library(fs)
+library(janitor)
+```
+
+
+Read some ward data in
+
+
+```{r}
+download.file("https://data.london.gov.uk/download/statistical-gis-boundary-files-london/9ba8c833-6370-4b11-abdc-314aa020d5e0/statistical-gis-boundaries-london.zip", 
+              destfile="prac9_data/statistical-gis-boundaries-london.zip")
+```
+Get the zip file and extract it
+
+```{r}
+listfiles <- dir_info(here::here("prac9_data")) %>% 
+  dplyr::filter(str_detect(path,".zip")) %>% 
+  dplyr::select(path) %>% 
+  pull() %>% 
+  #print out the .gz file 
+  print() %>% 
+  as.character() %>% 
+  utils::unzip(exdir=here::here("prac9_data"))
+```
+
+Look inside the zip and read in the .shp
+
+
+```{r}
+Londonwards <- dir_info(here::here("prac9_data",
+                                   "statistical-gis-boundaries-london",
+                                   "ESRI")) %>% 
+  #$mean exact match
+  
+  dplyr::filter(str_detect(path,
+                           "London_Ward_CityMerged.shp$")) %>% 
+  dplyr::select(path) %>% 
+  pull() %>%
+  st_read()
+```
+
+```{r}
+qtm(Londonwards)
+```
+
+Now we are going to read in some data from the London Data Store
+
+#read in some attribute data
+```{r}
+LondonWardProfiles <- read_csv("https://data.london.gov.uk/download/ward-profiles-and-atlas/772d2d64-e8c6-46cb-86f9-e52b4c7851bc/ward-profiles-excel-version.csv",
+                                col_names = TRUE,
+                                locale = locale(encoding = "Latin1"))
+```
+check all of the columns have been read in correctly
+```{r}
+
+Datatypelist <- LondonWardProfiles %>%
+  clean_names() %>% 
+  summarise_all(class) %>% 
+  pivot_longer(everything(),
+               names_to = "All_variables",
+               values_to = "Variable_class")
+Datatypelist
+```
+
+Cleaning the data as you read it in
+Examining the dataset as it is read in above, you can see that a number of fields in the dataset that should have been read in as numeric data, have actually been read in as character (text) data.
+
+If you examine your data file, you will see why. In a number of columns where data are missing, rather than a blank cell, the values ‘n/a’ have been entered in instead. Where these text values appear amongst numbers, the software will automatically assume the whole column is text.
+
+To deal with these errors, we can force to ignore these values by telling it what values to look out for that indicate missing dataread_csv
+
+```{r}
+LondonWardProfiles <- read_csv("https://data.london.gov.uk/download/ward-profiles-and-atlas/772d2d64-e8c6-46cb-86f9-e52b4c7851bc/ward-profiles-excel-version.csv",
+                                na=c("","NA","n/a"),col_names = TRUE,
+                                locale = locale(encoding = "Latin1"))
+```
+
+```{r}
+Datatypelist <- LondonWardProfiles %>%
+  clean_names() %>% 
+  summarise_all(class) %>% 
+  pivot_longer(everything(),
+               names_to = "All_variables",
+               values_to = "Variable_class")
+Datatypelist
+```
+
+Now you have read in both your boundary data and your attribute data, you need to merge the two together using a common ID. In this case, we can use the ward codes to achieve the join
+```{r}
+LonWardProfiles <- Londonwards %>% 
+  left_join(.,LondonWardProfiles,
+            by=c("GSS_CODE"="New code"))
+LonWardProfiles <- Londonwards%>%
+  left_join(.,
+            LondonWardProfiles, 
+            by = c("GSS_CODE" = "New code"))
+
+
+tmap_mode("plot")
+qtm(LonWardProfiles, 
+    fill = "Average GCSE capped point scores - 2014", 
+    borders = NULL,  
+    fill.palette = "Blues")
+  
+```
+
+7.4.1.2 Additional Data
+
+In addition to our main datasets, it might also be useful to add some contextual data. While our exam results have been recorded at the home address of students, most students would have attended one of the schools in the City.
+
+Let’s add some schools data as well.
+
+#might be a good idea to see where the secondary schools are in London too
+
+
+
+```{r}
+london_schools <- read_csv("https://data.london.gov.uk/download/london-schools-atlas/57046151-39a0-45d9-8dc0-27ea7fd02de8/all_schools_xy_2016.csv")
+```
+
+
+```{r}
+london_schools_sf <- st_as_sf(london_schools,
+                              coords = c("x","y"),
+                              crs=4326)
+```
+
+```{r}
+lond_sec_schools_sf <- london_schools_sf %>% 
+  filter(PHASE=='Secondary')
+tmap_mode("plot")
+qtm(lond_sec_schools_sf)
+``` 
+
+
+
+分析GCSE考试成绩 - 检验研究假设
+为了探索可能影响伦敦GCSE考试成绩的因素，我们将运行一系列不同的回归模型。回归模型只是我们的结果变量（伦敦每个病房的平均GCSE分数）与另一个变量或可能解释此结果的几个变量之间的线性关系的表达式。
+
+
+通过检查上图中GSCE分数的空间分布，很明显整个城市之间存在差异。我的研究问题是：
+
+哪些因素可能导致整个城市GCSE平均分数的差异？
+
+我将要测试的研究假设是，伦敦沃德斯还有其他可观察到的因素可能会影响居住在这些地区的学生的平均GCSE分数。
+
+在推理统计学中，我们无法明确证明假设是正确的，但我们可以试图反驳绝对没有发生任何有趣的事情，或者变量之间没有关联。我将用一些模型进行实证测试的零假设是，考试成绩与伦敦其他观察到的变量之间没有关系。
+
+对于那些对回归有所了解的人来说，您可能希望跳到下一节。但是，如果您不熟悉回归或想要复习，请继续阅读...
+
+回归模型中的线性关系可能最容易使用散点图来解释...
+
+
+
+```{r}
+q <- qplot(x = `Unauthorised Absence in All Schools (%) - 2013`, 
+           y = `Average GCSE capped point scores - 2014`, 
+           data=LonWardProfiles)
+#plot with a regression line - note, I've added some jitter here as the x-scale is rounded
+
+q+stat_smooth(method = "lm",se=FALSE,size=1)+
+  geom_jitter()
+
+```
+
+
+在这里，我绘制了伦敦每个病房的平均GCSE分数与数据集中另一个我认为可能有影响力的变量：每个病房因未经授权的缺勤而损失的上学日的百分比。
+
+请记住，我的零假设是GCSE分数与未经授权的缺课之间没有关系。如果这个原假设是正确的，那么我就不会期望在上面绘制的点云中看到任何模式。
+
+实际上，散点图显示，通常，作为 
+x
+ 轴自变量（未经授权的缺席）上升，我们的 
+y
+ 轴因变量（GCSE 分数）下降。这不是一个随机的点云，而是表明这里可能存在关系，所以我可能希望拒绝我的零假设。
+ 
+ 
+ 
+ 7.5.3在 R 中运行回归模型
+在上图中，我在函数中使用了一个名为"lm"的方法来绘制回归线。"lm"代表"线性模型"，是 R 中用于运行线性回归模型的标准函数。使用帮助系统了解有关stat_smooth()ggplot2lm - ?lm
+
+下面是可用于在散点图中绘制蓝线的代码。请注意，波浪号符号表示"建模者"。~
+
+首先，我们将清理所有数据名称，然后选择所需的名称。Janitor
+
+
+```{r}
+#run the linear regression model and store its outputs in an object called model1
+Regressiondata <- LonWardProfiles %>% 
+  clean_names() %>% 
+  dplyr::select(average_gcse_capped_point_scores_2014, 
+              unauthorised_absence_in_all_schools_percent_2013)
+
+# new model 
+model1 <- Regressiondata %>% 
+  lm(average_gcse_capped_point_scores_2014 ~
+               unauthorised_absence_in_all_schools_percent_2013,data=.)
+```
+
+```{r}
+summary(model1)
+```
+在运行回归模型时，我们有效地尝试测试（反驳）我们的原假设。如果我们的零假设为真，那么我们期望我们的系数 = 0。
+
+在上面模型的输出摘要中，您应该注意许多功能：
+
+系数估计值 - 这些是 
+β
+0
+ （拦截）和 
+β
+1
+ 等式1中的（斜率）参数估计值。您会注意到 
+β
+0
+=
+371.471
+ 和 
+β
+1
+=
+−
+41.237
+ 它们非常接近我们之前从图表中读到的370和-40的估计值，但更精确。
+
+系数标准误差- 这些误差表示系数与因变量的平均值（其标准偏差）相差的平均量。因此，对于未经授权的缺课增加1%，虽然该模型表示我们可能预计GSCE分数将下降-41.2分，但平均而言，这可能会相差约1.9分。根据经验，我们正在寻找相对于系数大小的较低标准误差值。
+
+系数 t 值- 这是系数除以标准误差的值，因此可以将其视为一种标准化系数值。值越大（正数或负数），特定自变量对因变量的相对影响就越大（当我们在模型中有几个自变量时，这可能更有用）。
+
+系数 p 值 - Pr（>|t|）- p 值是显著性的度量。关于p值有很多争论，我不会在这里讨论，但本质上它指的是获得与一组随机数据中观察到的系数一样大的系数的概率。p值可以被认为是百分比，所以如果我们的p值为0.5，那么我们的系数有5%的机会可能发生在某些随机数据中，或者换句话说，95%的几率，超出系数可能只发生在我们的数据中。根据经验，p 值越小，该变量在故事中越重要，并且观察到的关系只是随机的几率就越小。一般来说，统计学家使用5%或0.05作为统计显著性的可接受截止值 - 任何大于此值的东西，我们都应该持怀疑态度。
+
+在代码中用于表示重要性。我们通常希望在我们的系数旁边至少有一个，以便值得考虑。r***, **, **, .*
+
+R 平方- 这可以被视为模型有多好的指示 - "拟合优度"的度量（其中还有许多其他模型）。 
+r
+2
+ 是一个非常直观的拟合度量，因为它的范围在0到1之间，可以被认为是因变量（在我们的例子中GCSE评分）中变异的百分比，由自变量的变化来解释。在我们的示例中，一个 
+r
+2
+ 值为0.42表示GCSE分数中约42%的差异可以通过未失学的变化来解释。换句话说，这是一个很好的模型。这 
+r
+2
+ 随着更多独立解释变量添加到模型中，值将增加，因此，如果这可能是一个问题，则可以使用调整后的 r 平方值来解释这种影响
+ 
+ 
+ 7.5.3.2扫帚
+线性回归模型的输出是混乱的，就像所有的事情一样，R混乱可以被整理，在这种情况下是用扫帚！或者也是包装整洁模型的派对的包装。broom
+
+在这里，让我们加载并整理我们的输出...您将需要安装 或 。该函数只会从模型中生成一个提示或统计结果！broomtidymodelsbroomtidy()
+
+
+
+```{r}
+library(broom)
+tidy(model1)
+```
+
+```{r}
+glance(model1)
+```
+ 
+ 假设1 - 因变量和自变量之间存在线性关系
+测试此假设的最佳方法是绘制类似于之前创建的散点图。创建一系列散点图可能并不总是可行的，因此检查线性关系是否可能的快速方法是查看变量的频率分布。如果它们是正态分布的，那么如果两个变量在某种程度上是相关的，那么这将是线性关系。
+
+例如，看看前面两个变量的频率分布
+
+
+```{r}
+#use janitor to cleanm hte names
+LonWardProfiles <- LonWardProfiles %>% 
+  clean_names()
+# check the distribution of these varibales first
+ggplot(LonWardProfiles,aes(x=average_gcse_capped_point_scores_2014))+
+  geom_histogram(aes(y=..density..),
+                 binwidth = 5)+
+  geom_density(colour="red", 
+               size=1, 
+               adjust=1)
+```
+在这里，相加意味着直方图是密度图，这绘制了数据中的任何值等于该值的几率。..density..
+
+
+```{r}
+ggplot(LonWardProfiles,aes(x=unauthorised_absence_in_all_schools_percent_2013))+
+  geom_histogram(aes(y=..density..),
+                 binwidth = 0.1)+
+    geom_density(colour="red", 
+               size=1, 
+               adjust=1)
+```
+我们将这两个分布描述为相对"正常"或高斯分布，因此更有可能具有线性相关性（如果它们确实相关）。
+ 
+ 
+ 将此与房价中位数变量进行对比：
+
+```{r}
+ggplot(LonWardProfiles,aes(x=median_house_price_2014))+geom_histogram()
+```
+
+ 我们会将其描述为不正常和/或积极的"偏斜"分布，即在城市中观察到的平均房价的下端有更多的观察结果，但是分布有一个长尾，即有少数病房的平均房价确实非常大。
+
+如果我们将原始房价变量与GCSE分数绘制，我们得到以下散点图：
+
+```{r}
+qplot(x = median_house_price_2014,
+      y = average_gcse_capped_point_scores_2014,
+      data=LonWardProfiles)
+```
+
+
+7.5.6.1转换变量
+我们能够在两个变量之间实现线性关系的一种方法是转换非正态分布变量，使其更正态分布。
+
+关于这是否是一件明智的事情存在一些争论，因为除其他外，变换变量的系数更难解释，但是，我们将在这里看看它是否有所作为。
+```{r}
+ggplot(LonWardProfiles,aes(x=log(median_house_price_2014)))+geom_histogram()
+```
+这看起来更像是正态分布，但它仍然有点偏斜。
+
+幸运的是，在R中，我们可以使用包中的函数来尝试沿着Tukey阶梯的一系列转换：symbox()car
+
+
+
+
+```{r}
+symbox(~median_house_price_2014,
+       LonWardProfiles,na.rm=T,
+       powers=seq(-3,3,by=.5))
+```
+观察上面的图，似乎将我们的房价变量提高到-1的幂应该会导致更正态的分布：
+
+```{r}
+
+ggplot(LonWardProfiles,aes(x=log(median_house_price_2014)^-1))+geom_histogram()
+```
+ 
+ 
+ 
+```{r}
+qplot(x=(median_house_price_2014)^-1,
+      y=average_gcse_capped_point_scores_2014,
+      data=LonWardProfiles)
+```
+
+```{r}
+qplot(x = log(median_house_price_2014), 
+      y = average_gcse_capped_point_scores_2014, 
+      data=LonWardProfiles)
+```
+取决于独立变量或因变量（GCSE分数）是否已经转换取决于我们如何解释它们 -请参阅这些解释规则
+
+
+模型中的残差应呈正态分布
+这个假设很容易检查。当我们之前运行 Model1 时，存储在 Model 1 对象中的输出之一是数据集中每个事例 （Ward） 的残值。我们可以使用这些值访问这些值，从中将模型输出添加到原始GCSE数据中...augment()broom
+
+我们可以将它们绘制为直方图，并查看是否存在正态分布：
+
+```{r}
+model_data <- model1 %>% 
+  augment(.,Regressiondata)
+#plot residuals
+model_data %>% 
+  dplyr::select(.resid) %>% 
+  pull() %>% 
+  qplot()+
+  geom_histogram()
+  
+```
+通过检查上面的直方图，我们可以很高兴我们的残差看起来是相对正态分布的。
+
+
+假设3 - 自变量无多线性
+现在，到目前为止，我们正在试验的回归模型是一个简单的二元（两个变量）模型。回归建模的一个好处是，虽然我们只能在两维（或最大3维散点图）中轻松可视化线性关系，但从数学上讲，我们可以拥有尽可能多的维度/变量。
+
+因此，我们可以通过添加一些我们认为可能影响GSCE分数的更多解释变量，将模型1扩展到多元回归模型中。让我们尝试一下之前的日志或^-1转换的房价变量（合理之处在于，较高的房价表明更富裕，因此，可能更多地参与教育）：
+
+
+
+```{r}
+Regressiondata2 <- LonWardProfiles %>% 
+  clean_names() %>% 
+  dplyr::select(average_gcse_capped_point_scores_2014,unauthorised_absence_in_all_schools_percent_2013,median_house_price_2014)
+
+
+
+model2 <- lm(average_gcse_capped_point_scores_2014~unauthorised_absence_in_all_schools_percent_2013 + 
+               log(median_house_price_2014),data=Regressiondata2)
+model2
+tidy(model2)
+summary(model2)
+```
+
+
+```{r}
+glance(model2)
+
+```
+
+
+
+```{r}
+# and for the Future use write the residual out 
+model_data2 <- model2 %>% 
+  augment(.,Regressiondata2)
+
+LonWardProfiles <- LonWardProfiles %>% 
+  mutate(model2resids = residuals(model2))
+```
+
+
+通过检查上面的输出，很明显，在我们的模型中包括房价中位数可以将拟合度从约 42% 的\（r^2\）提高到 48% 的\（r^2\）。房价中位数也是一个统计上显着的变量。
+
+但是我们的两个解释变量是否满足无多重性假设？如果不是，并且变量高度相关，那么我们实际上是在重复计算这些变量的影响，并夸大它们的解释力。
+
+为了检查这一点，我们可以计算变量之间的乘积矩相关系数，使用pacakge，这是的一部分。在一个理想的世界里，我们会寻找一些小于0.8相关性的东西。corrr()tidymodels
+
+```{r}
+library(corrr)
+
+Correlation <- LonWardProfiles %>% 
+  st_drop_geometry() %>% 
+  dplyr::select(average_gcse_capped_point_scores_2014,
+         unauthorised_absence_in_all_schools_percent_2013,
+         median_house_price_2014) %>% 
+  mutate(median_house_price_2014 =log(median_house_price_2014)) %>% 
+  correlate() %>% 
+  focus(-average_gcse_capped_point_scores_2014,mirror=TRUE)
+
+#visualise the correlation matrix
+rplot(Correlation)
+
+```
+
+```{r}
+
+```
+```{r}
+vif(model2)
+```
+
+```{r}
+position <- c(10:74)
+Correlation_all <- LonWardProfiles %>% 
+  st_drop_geometry() %>% 
+  dplyr::select(position) %>% 
+  correlate()
+
+rplot(Correlation_all)
+
+```
+假设5 - 错误的独立性
+此假设仅声明模型中的残差值（误差）不得以任何方式相关。如果是，那么它们表现出自相关，这表明在后台可能正在发生一些事情，而我们在模型中没有充分考虑。
+标准自相关
+如果要对没有显式空间或时间维度的数据运行回归模型，则自相关的标准检验将是 Durbin-Watson 检验。
+
+这将测试残差是否相关，并生成范围介于 0 和 4 之间的汇总统计量，其中 2 表示无自相关。大于 2 的值表示负自相关，值小于 2 表示后自相关。
+
+在他优秀的教科书中，安迪·菲尔德建议你应该关注德宾-沃森测试统计<1或>3。那么让我们看看：
+
+```{r}
+#run durbin-watson test
+DW <- durbinWatsonTest(model2)
+tidy(DW)
+```
+
+如您所见，我们模型的 DW 统计数据为 1.61，因此有一些自相关指示，但也许没什么可担心的。
+
+然而
+
+我们使用的是空间参考数据，因此我们应该检查空间自相关。
+
+我们应该执行的第一个测试是映射残差，以查看是否存在任何明显的明显模式：
+```{r}
+# now plot the residuals
+tmap_mode("view")
+
+tm_shape(LonWardProfiles)+
+  tm_polygons("model2resids",
+              palette="RdYlBu")+
+  tm_shape(lond_sec_schools_sf)+tm_dots(col="TYPE")
+```
+
+是的 - 你们中的一些人会从两周前的实际情况中记住这一点。我们可以计算许多不同的统计数据来检查空间自相关 - 其中最常见的是莫兰I
+
+
+#calculate the centroids of all Wards in London
+```{r}
+coordsW <- LonWardProfiles %>% 
+  st_centroid() %>% 
+  st_geometry()
+plot(coordsW)
+```
+#Now we need to generate a spatial weights matrix 
+#(remember from the lecture a couple of weeks ago). 
+#We'll start with a simple binary matrix of queen's case neighbours
+
+
+```{r}
+LWard_nb <- LonWardProfiles %>% 
+  poly2nb(.,queen=T)
+
+#or nearest neighbours
+Knn_wards <- coordsW %>% 
+  knearneigh(.,k=4)
+
+LWard_knn <- Knn_wards %>% 
+  knn2nb()
+
+#plot them
+plot(Lward_nb,st_geometry(coordsW),col="red")
+```
+```{r}
+plot(LWard_knn, st_geometry(coordsW), col="blue")
+```
+这个论点意味着输出的风格 - 是二进制编码将它们列为邻居或不，我们上周看到的行标准化。styleBW
+
+现在运行一个莫兰的I测试残差，首先使用女王邻居
+
+
+```{r}
+#create a spatial weights matrix object from these weights
+
+Lward.queens_weight <- LWard_nb %>%
+  nb2listw(., style="W")
+
+Lward.knn_4_weight <- LWard_knn %>%
+  nb2listw(., style="W")
+```
+
+```{r}
+Queen <- LonWardProfiles %>%
+  st_drop_geometry()%>%
+  dplyr::select(model2resids)%>%
+  pull()%>%
+  moran.test(., Lward.queens_weight)%>%
+  tidy()
+```
+
+```{r}
+Nearest_neighbour <- LonWardProfiles %>%
+  st_drop_geometry()%>%
+  dplyr::select(model2resids)%>%
+  pull()%>%
+  moran.test(., Lward.knn_4_weight)%>%
+  tidy()
+
+Queen
+```
+
+```{r}
+Nearest_neighbour
+```
+观察女王的邻居和k-最近的邻居4的莫兰I统计数据，我们可以看到莫兰的I统计数据在0.27和0.29之间。记住莫兰的I范围在-1和+1之间（0表示没有空间自相关），我们可以得出结论，残差中存在一些弱到中等的空间自相关。
+
+这意味着，尽管通过了线性回归的大多数假设，但我们在这里可能会遇到一种情况，即存在一些空间自相关可能导致对参数和显著性值的偏倚估计。
+
+
+
+
+Spatial Regression Models
+
+处理空间自相关残差 - 空间滞后和空间误差模型
+
+
+7.6空间回归模型
+7.6.1处理空间自相关残差 - 空间滞后和空间误差模型
+7.6.1.1空间滞后（滞后因变量）模型
+在我们上面运行的示例模型中，我们测试了原假设，即伦敦不同学区中学生的平均GCSE分数与其他解释变量之间没有关系。运行回归模型来测试缺课和平均房价的影响，早期迹象表明我们可以拒绝这种零假设，因为运行的回归模型表明，GCSE分数中近50%的差异可以用未经授权的缺课和平均房价的变化来解释。
+
+然而，对模型中的残差运行Moran's I检验表明，可能存在一些空间自相关，这表明模型高估GCSE分数（在上面的地图中以蓝色显示，残差为负）和预测不足的地方（以红色/橙色显示）偶尔彼此靠近。
+
+将伦敦中学的位置叠加到地图上，揭示了为什么会出现这种情况。伦敦的许多学校都位于学生将要居住的病房的房舍内或附近。因此，在一所学校上学的学生很可能来自邻近的一些病房。
+
+因此，一个病房的平均GCSE分数可能与另一个病房的平均GCSE分数有关，因为居住在这些病房的学生可能就读于同一所学校。这可能是自相关的源。
+
+Ward和Gleditsch（2008）描述了这种情况（其中我们的价值y 
+y
+ 因变量 - GCSE分数 - 可能受到邻近值的影响），并建议处理它的方法是在等式右侧的自变量中加入该变量的空间滞后版本。在本例中，公式 1 将更新为如下所示：
+
+y我=β0+β1x我+ρw我.y我+ε我
+
+在这个等式中，w 
+w
+ 是您生成的空间权重矩阵，并且w我 
+w
+i
+ 是任何沃德的所有邻近区域（在我们的例子中为病房）的向量y我 
+y
+i
+ .
+
+在此模型中，正值为ρw我.y我 
+ρ
+w
+i
+.
+y
+i
+ 参数将指示，如果平均而言，相邻的病房也具有较高的GCSE分数值，则GCSE分数的平均值预计会更高。
+
+有关运行空间滞后回归模型和解释输出的更多详细信息，请参阅 Ward 和 Gleditsch （2008） 关于空间滞后模型的章节，可在此处在线获得：https://methods.sagepub.com/book/spatial-regression-models/n2.xml
+
+让我们再次运行原始模型，以提醒自己参数：
+
+
+
+
+```{r}
+#original Model 
+model2 <- lm(average_gcse_capped_point_scores_2014 ~ unauthorised_absence_in_all_schools_percent_2013 + 
+               log(median_house_price_2014), data = LonWardProfiles)
+tidy(model2)
+```
+
+现在，使用女王大小写权重矩阵运行空间滞后回归模型
+
+```{r}
+library(spatialreg)
+
+slag_dv_model2_queen <- lagsarlm(average_gcse_capped_point_scores_2014 ~ unauthorised_absence_in_all_schools_percent_2013 + 
+               log(median_house_price_2014),data=LonWardProfiles,
+               nb2listw(LWard_nb, style="C"), 
+               method = "eigen")
+
+tidy(slag_dv_model2_queen)
+```
+```{r}
+#glance() gives model stats but this need something produced from a linear model
+#here we have used lagsarlm()
+glance(slag_dv_model2_queen)
+```
+
+```{r}
+t <- summary(slag_dv_model2_queen)
+```
+
+
+使用 Queen's case 空间权重矩阵运行空间滞后模型可发现，在此示例中，空间滞后因变量之间存在一个微不足道且很小的效应。但是，对邻居的不同概念我们可能会得到不同的结果
+
+这里：
+
+Rho是我们的空间滞后，用于测量由空间权重矩阵定义的周围空间区域中的变量。我们用这个作为额外的解释变量来解释聚类（由Moran的I标识）
+
+似然比 （LR） 检验显示延迟的添加是否是一种改进，以及这是否显著
+
+拉格朗日乘数 （LM） 是对滞后模型残差中是否存在空间自相关的检验。如果显著，则可以拒绝 Null（无空间自相关）并接受替代方法（空间自相关）
+
+警告不要将此系数与常规 OLS 进行比较 — 请参见拟合和解释空间滞后模型
+
+
+
+```{r}
+slag_dv_model2_queen <- lagsarlm(average_gcse_capped_point_scores_2014 ~ unauthorised_absence_in_all_schools_percent_2013 + 
+               log(median_house_price_2014),
+               data = LonWardProfiles,
+               nb2listw(LWard_knn,
+                        style = "C"),
+                        method = "eigen")
+
+tidy(slag_dv_model2_knn4)
+```
+```{r}
+#write out the residuals
+LonWardProfiles <- LonWardProfiles %>% 
+  mutate(slag_dv_model2_knn4_resids=residuals(slag_dv_model2_knn4))
+
+KNN4Moran <- LonWardProfiles %>% 
+  st_drop_geometry() %>% 
+  dplyr::select(slag_dv_model2_knn4_resids) %>% 
+  pull() %>% 
+  moran.test(.,Lward.knn_4_weight) %>% 
+  tidy()
+KNN4Moran
+
+```
+
+
+```{r}
+sem_model1 <- errorsarlm(average_gcse_capped_point_scores_2014 ~ unauthorised_absence_in_all_schools_percent_2013 + 
+               log(median_house_price_2014), data=LonWardProfiles,
+               nb2listw(LWard_knn,style = "C"),
+               method = "eigen")
+
+tidy(sem_model1)
+```
+将空间误差模型的结果与空间滞后模型和原始OLS模型进行比较，此处的建议是，残差中的空间相关误差导致高估OLS模型中未经授权缺席的重要性，并低估了富裕的重要性，以房价中位数表示。相反，与空间滞后模型相比，空间误差模型为两个变量估计的参数值更高。
+
+滞后模型考虑了一个区域中因变量的值可能与相邻区域中该变量的值相关联或受其影响的情况（但是我们选择在空间权重矩阵中定义相邻变量）。以我们的例子为例，一个社区的平均GCSE分数可能与另一个社区的平均GCSE分数有关，因为两个社区的学生都可以上同一所学校。您可能能够想到可能发生类似关联的其他示例。如果将因变量中的空间自相关（更近的空间单位具有相似的值）与 Moran 的 I 标识，则可以运行滞后模型。
+
+误差模型再次处理残差（点与模型线之间的垂直距离 - 误差 - 过度预测或预测不足）的空间自相关（更近的空间单位具有相似的值），可能通过Moran的I分析揭示。误差模型不是假设相邻的自变量正在影响因变量，而是假设模型的规范或使用的数据有问题（例如，聚类错误是由于一些未观察到的聚类变量未包含在模型中）。例如，与邻近社区相近的GCSE分数可能相似，但不是因为学生就读于同一所学校，而是因为这些邻近地区的学生来自相似的社会经济或文化背景，这在原始模型中没有作为自变量包括在内。没有空间过程（没有跨自治市镇相互作用），只是一个未解释但有影响力的变量的聚类。
+
+
+
+
+```{r}
+library(spdep)
+
+Lward.queens_weight_ROW <- LWard_nb %>% 
+  nb2listw(.,style = "W")
+
+lm.LMtests(model2, Lward.queens_weight_ROW, test = c("LMerr","LMlag","RLMerr","RLMlag","SARMA"))
+```
+
+通常，您将首先运行 OLS 回归，然后查找残差的空间自相关（Moran's I）。
+
+在此阶段，您需要对模型做出决定：
+
+它是全局模型（错误/滞后）还是局部模型（GWR）？
+是否可以将单个模型（误差/滞后）拟合到研究区域？
+空间自相关是问题（错误）还是显示局部趋势（GWR）？
+当然，您可以执行 OLS、空间滞后和 GWR，只要它们都对您的分析有所贡献。
+
+
+
+```{r}
+extractdata <- read_csv("https://www.dropbox.com/s/qay9q1jwpffxcqj/LondonAdditionalDataFixed.csv?raw=1")
+```
+
+```{r}
+LonWardProfiles <- LonWardProfiles %>% 
+  left_join(.,extractdata,
+            by=c("gss_code"="Wardcode"))
+LonWardProfiles %>% 
+  names() %>% 
+  tail(.,n=10)
+```
+
+扩展回归模型 - 虚拟变量
+如果不是将一条线拟合到我们的点云中，而是根据我们正在分析的沃德是否属于某个或其他组来拟合几条线，那该怎么办？例如，如果上学和取得良好考试成绩之间的关系在伦敦内外之间有所不同，该怎么办？我们能测试一下吗？好吧，是的，我们可以 - 实际上很容易。
+
+如果我们以不同的方式对代表内伦敦和外伦敦病房的点进行着色，我们可以开始看到可能会有一些有趣的事情发生。使用2011年的数据（因为没有最新数据中存在的舍入误差），外伦敦的缺席和GCSE分数之间的关系似乎比内伦敦更强。我们可以在标准线性回归模型中对此进行测试。
+
+
+```{r}
+p <- ggplot(LonWardProfiles,
+            aes(x=UnauthAbsenceSchools11, 
+                y=average_gcse_capped_point_scores_2014))
+p+geom_point(aes(colour = InnerOuter))
+```
+
+虚拟变量始终是分类数据（伦敦内部或外部，或红色/蓝色等）。当我们将它们合并到回归模型中时，它们的作用是将我们的分析拆分为多个组。在上图中，这实际上意味着红点有一条单独的回归线，蓝点有一条单独的回归线。
+
+
+#first, let's make sure R is reading our InnerOuter variable as a factor
+#see what it is at the moment...
+
+```{r}
+isitfactor <- LonWardProfiles %>% 
+  dplyr::select(InnerOuter) %>% 
+  summarise_all(class)
+isitfactor
+
+```
+
+
+# change to factor
+```{r}
+LonWardProfiles <- LonWardProfiles %>% 
+  mutate(inner_outer=as.factor(InnerOuter))
+
+
+```
+#now run the model
+```{r}
+model3 <- lm(average_gcse_capped_point_scores_2014 ~ unauthorised_absence_in_all_schools_percent_2013 + 
+               log(median_house_price_2014) + 
+               inner_outer, 
+             data = LonWardProfiles)
+
+tidy(model3)
+```
+
+```{r}
+contrasts(LonWardProfiles$inner_outer)
+
+```
+
+```{r}
+LonWardProfiles <- LonWardProfiles %>% 
+  mutate(inner_outer=relevel(inner_outer,
+         ref="Outer"))
+model3 <- lm(average_gcse_capped_point_scores_2014 ~ unauthorised_absence_in_all_schools_percent_2013 + 
+               log(median_house_price_2014) + 
+               inner_outer, 
+             data = LonWardProfiles)
+
+tidy(model3)
+```
+您会注意到，模型中唯一发生变化的是，inner_outer变量的系数现在与内伦敦相关，现在是负数（这意味着与外伦敦相比，居住在内伦敦可能会使您的GCSE平均分数降低10.93分）。模型的其余部分完全相同。
+
+7.6.6任务：进一步调查 - 在多元回归模型中添加更多解释变量
+您已经向您展示了如何开始对伦敦的平均GCSE分数进行建模，但是到目前为止，我们构建的模型在解释变量方面相当简单。
+
+您应该尝试根据 LondonWards 数据集中的数据构建 GCSE 表现的最佳模型。尝试添加不同的变量 - 以这种方式构建回归模型时，您试图在尽可能增加R平方值之间达到一个最佳点，但解释变量尽可能少。
+
+
+7.7任务3 - 空间非平稳性和地理加权回归模型（GWR）
+```{r}
+myvars <- LonWardProfiles %>% 
+  dplyr::select(average_gcse_capped_point_scores_2014,
+         unauthorised_absence_in_all_schools_percent_2013,
+         median_house_price_2014,
+         rate_of_job_seekers_allowance_jsa_claimants_2015,
+         percent_with_level_4_qualifications_and_above_2011,
+         inner_outer)
+```
+
+#check their correlations are OK
+
+
+Corrlation_myVars = 
+```{r}
+Correlation_my_myVars <- myvars %>% 
+  st_drop_geometry() %>% 
+  dplyr::select(-inner_outer) %>% 
+  correlate()
+
+rplot(Correlation_my_myVars)
+```
+#run a final OLS model
+
+```{r}
+model_final <- lm(average_gcse_capped_point_scores_2014 ~ unauthorised_absence_in_all_schools_percent_2013 + 
+                    log(median_house_price_2014) + 
+                    inner_outer + 
+                    rate_of_job_seekers_allowance_jsa_claimants_2015 +
+                    percent_with_level_4_qualifications_and_above_2011, 
+                  data = myvars)
+summary(model_final)
+```
+
+```{r}
+LonWardProfiles <- LonWardProfiles %>% 
+  mutate(model_final_res=residuals(model_final))
+
+par(mfrow=c(2,2))
+plot(model_final)
+```
+
+```{r}
+qtm(LonWardProfiles,fill="model_final_res")
+```
+
+
+```{r}
+final_model_Moran <- LonWardProfiles %>% 
+  st_drop_geometry() %>% 
+  dplyr::select(model_final_res) %>% 
+  pull() %>% 
+  moran.test(.,Lward.knn_4_weight) %>% 
+  tidy()
+
+final_model_Moran
+```
+现在，我们可能可以停止在这一点上运行空间误差模型，但可能是空间自相关导致我们的模型出现问题，可能是"全局"回归模型没有捕获完整的故事。在我们研究区域的某些部分，因变量和自变量之间的关系可能不会表现出相同的斜率系数。例如，虽然未经授权的缺勤率的增加通常与GCSE分数（学生在较低的考试成绩中错过学校成绩）呈负相关，但在城市的某些地区，它们可能是正相关的（在城市的富裕地区，富裕的父母可能在一年中的部分时间让他们的孩子入学，然后在一年中的另一部分时间住在世界其他地方， 导致未经授权的缺勤数字过高。在学期期间，滑雪假期更便宜，但学生仍然拥有生活在富裕家庭的所有其他优势，这将使他们的考试成绩受益。
+
+
+```{r}
+library(spgwr)
+
+coordW2 <- st_coordinates(coordsW)
+LonWardProfiles2 <- cbind(LonWardProfiles,coordW2)
+#按列合并矩阵,要求行数必须相同
+
+GWRbandwidth <- gwr.sel(average_gcse_capped_point_scores_2014 ~ unauthorised_absence_in_all_schools_percent_2013 + 
+                    log(median_house_price_2014) + 
+                    inner_outer + 
+                    rate_of_job_seekers_allowance_jsa_claimants_2015 +
+                    percent_with_level_4_qualifications_and_above_2011, data=LonWardProfiles2,
+                    coords = cbind(LonWardProfiles2$X, LonWardProfiles2$Y),
+                    adapt=T)
+
+
+```
+
+```{r}
+GWRbandwidth
+```
+
+最佳带宽约为 0.015，这意味着应将所有空间单位的 1.5% 用于基于 k 最近邻的局部回归。这是626个病房中的9个。
+
+```{r}
+gwr.model=gwr(average_gcse_capped_point_scores_2014 ~ unauthorised_absence_in_all_schools_percent_2013 + 
+                    log(median_house_price_2014) + 
+                    inner_outer + 
+                    rate_of_job_seekers_allowance_jsa_claimants_2015 +
+                    percent_with_level_4_qualifications_and_above_2011, 
+              data = LonWardProfiles2,
+              coords = cbind(LonWardProfiles2$X, LonWardProfiles2$Y),
+              adapt=GWRbandwidth,
+              hatmatrix = TRUE,
+              se.fit=TRUE)
+
+gwr.model
+
+```
+
+```{r}
+results <- as.data.frame(gwr.model$SDF)
+names(results)
+```
+```{r}
+LonWardProfiles2 <- LonWardProfiles %>%
+  mutate(coefUnauthAbs = results$unauthorised_absence_in_all_schools_percent_2013,
+         coefHousePrice = results$log.median_house_price_2014.,
+         coefJSA = rate_of_job_seekers_allowance_jsa_claimants_2015,
+         coefLev4Qual = percent_with_level_4_qualifications_and_above_2011)
+```
+
+```{r}
+tm_shape(LonWardProfiles2) +
+  tm_polygons(col = "coefUnauthAbs", 
+              palette = "RdBu", 
+              alpha = 0.5)
+```
+
+
+```{r}
+#run the significance test
+sigTest = abs(results$"log.median_house_price_2014.")-2 * results$"log.median_house_price_2014._se"
+
+
+#store significance results
+LonWardProfiles2 <- LonWardProfiles2 %>%
+  mutate(GWRUnauthSig = sigTest)
+```
+
+
+
+```{r}
+tm_shape(LonWardProfiles2) +
+  tm_polygons(col = "GWRUnauthSig", 
+              palette = "RdYlBu")
+```
+
+
